@@ -1,0 +1,156 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: swiftpay-postgres
+    environment:
+      POSTGRES_DB: swiftpay
+      POSTGRES_USER: swiftpay
+      POSTGRES_PASSWORD: swiftpay
+    ports:
+      # Host access on 5433 (5432 is commonly taken by a local Postgres)
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U swiftpay -d swiftpay"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: swiftpay-redis
+    ports:
+      # Host access on 6380 (6379 is commonly taken by a local Redis)
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: swiftpay-kafka
+    ports:
+      # Host access (e.g. running services from the IDE): localhost:29092
+      - "29092:29092"
+    environment:
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: swiftpay-clickhouse
+    environment:
+      CLICKHOUSE_DB: swiftpay_analytics
+      CLICKHOUSE_USER: swiftpay
+      CLICKHOUSE_PASSWORD: swiftpay
+    ports:
+      # HTTP interface (queries, JDBC)
+      - "8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      # 127.0.0.1 (not localhost): busybox wget resolves localhost to ::1
+      # but ClickHouse only listens on IPv4 inside the container
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 -O /dev/null http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  transaction-gateway:
+    build: ./transaction-gateway
+    container_name: swiftpay-transaction-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/swiftpay
+      SPRING_DATASOURCE_USERNAME: swiftpay
+      SPRING_DATASOURCE_PASSWORD: swiftpay
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  ledger:
+    build: ./ledger
+    container_name: swiftpay-ledger
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/swiftpay
+      SPRING_DATASOURCE_USERNAME: swiftpay
+      SPRING_DATASOURCE_PASSWORD: swiftpay
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      # Waits for the gateway so shared tables are created and seeded
+      # before the ledger's Hibernate ddl-auto runs against the same DB.
+      transaction-gateway:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  analytics-worker:
+    build: ./analytics-worker
+    container_name: swiftpay-analytics-worker
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:clickhouse://clickhouse:8123/swiftpay_analytics
+      SPRING_DATASOURCE_USERNAME: swiftpay
+      SPRING_DATASOURCE_PASSWORD: swiftpay
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+volumes:
+  postgres-data:
+  clickhouse-data:

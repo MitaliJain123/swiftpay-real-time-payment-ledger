@@ -19,24 +19,33 @@ public class IdempotencyService {
         this.redisTemplate = redisTemplate;
     }
 
-    public boolean exists(String transactionId) {
+    /**
+     * Atomically reserves the transaction id (Redis SET NX).
+     *
+     * @return true if this is the first time the transaction id is
+     *         seen, false if it was already reserved by a previous
+     *         (or concurrent) request.
+     */
+    public boolean reserve(String transactionId) {
 
         String key = buildKey(transactionId);
 
         return Boolean.TRUE.equals(
-                redisTemplate.hasKey(key)
+                redisTemplate.opsForValue().setIfAbsent(
+                        key,
+                        "PROCESSED",
+                        IDEMPOTENCY_TTL
+                )
         );
     }
 
-    public void save(String transactionId) {
+    /**
+     * Releases a reserved transaction id so the client can retry
+     * after a processing failure.
+     */
+    public void release(String transactionId) {
 
-        String key = buildKey(transactionId);
-
-        redisTemplate.opsForValue().set(
-                key,
-                "PROCESSED",
-                IDEMPOTENCY_TTL
-        );
+        redisTemplate.delete(buildKey(transactionId));
     }
 
     private String buildKey(String transactionId) {

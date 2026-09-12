@@ -61,27 +61,24 @@ public class LedgerService {
         if (payment.getStatus() == PaymentStatus.FAILED) {
             return;
         }
-        User sender = userRepository
-                .findByIdForUpdate(
-                        event.getSenderId()
-                )
-                .orElseThrow(() ->
-                        new IllegalStateException(
-                                "Sender not found: "
-                                        + event.getSenderId()
-                        )
-                );
+        // Always lock users in ascending id order to avoid deadlocks
+        // when two opposite payments (A->B and B->A) run concurrently.
+        Long senderId = event.getSenderId();
+        Long receiverId = event.getReceiverId();
 
-        User receiver = userRepository
-                .findByIdForUpdate(
-                        event.getReceiverId()
-                )
-                .orElseThrow(() ->
-                        new IllegalStateException(
-                                "Receiver not found: "
-                                        + event.getReceiverId()
-                        )
-                );
+        Long firstLockId = senderId < receiverId ? senderId : receiverId;
+        Long secondLockId = senderId < receiverId ? receiverId : senderId;
+
+        User firstLocked = lockUser(firstLockId);
+        User secondLocked = lockUser(secondLockId);
+
+        User sender = firstLocked.getId().equals(senderId)
+                ? firstLocked
+                : secondLocked;
+
+        User receiver = firstLocked.getId().equals(senderId)
+                ? secondLocked
+                : firstLocked;
 
         if (!sender.getCurrency()
                 .equalsIgnoreCase(event.getCurrency())) {
@@ -200,6 +197,17 @@ public class LedgerService {
         eventProducer.publishPaymentCompleted(
                 completedEvent
         );
+    }
+
+    private User lockUser(Long userId) {
+
+        return userRepository
+                .findByIdForUpdate(userId)
+                .orElseThrow(() ->
+                        new IllegalStateException(
+                                "User not found: " + userId
+                        )
+                );
     }
 
     private void markPaymentFailed(

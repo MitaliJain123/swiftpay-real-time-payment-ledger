@@ -49,29 +49,7 @@ public class PaymentService {
             );
         }
 
-        // 2. Check Redis idempotency
-        if (idempotencyService.exists(
-                request.getTransactionId())) {
-
-            Payment existingPayment =
-                    paymentRepository
-                            .findByTransactionId(
-                                    request.getTransactionId()
-                            )
-                            .orElseThrow(() ->
-                                    new PaymentException(
-                                            "Duplicate transaction"
-                                    )
-                            );
-
-            return new PaymentResponse(
-                    existingPayment.getTransactionId(),
-                    existingPayment.getStatus(),
-                    "Transaction already processed"
-            );
-        }
-
-        // 3. Validate sender
+        // 2. Validate sender
         User sender = userRepository
                 .findById(request.getSenderId())
                 .orElseThrow(() ->
@@ -80,7 +58,7 @@ public class PaymentService {
                         )
                 );
 
-        // 4. Validate receiver
+        // 3. Validate receiver
         userRepository
                 .findById(request.getReceiverId())
                 .orElseThrow(() ->
@@ -89,7 +67,8 @@ public class PaymentService {
                         )
                 );
 
-        // 5. Check balance
+        // 4. Check balance (fast pre-check; the ledger service
+        // performs the authoritative check under row locks)
         if (sender.getBalance()
                 .compareTo(request.getAmount()) < 0) {
 
@@ -98,57 +77,92 @@ public class PaymentService {
             );
         }
 
-        // 6. Create PENDING payment
-        Payment payment = new Payment();
+        // 5. Atomically reserve the transaction id in Redis (SET NX).
+        // If it was already reserved, this is a duplicate request.
+        if (!idempotencyService.reserve(
+                request.getTransactionId())) {
 
-        payment.setTransactionId(
-                request.getTransactionId()
-        );
+            return duplicateResponse(request.getTransactionId());
+        }
 
-        payment.setSenderId(
-                request.getSenderId()
-        );
+        try {
+            // 6. Create PENDING payment
+            Payment payment = new Payment();
 
-        payment.setReceiverId(
-                request.getReceiverId()
-        );
+            payment.setTransactionId(
+                    request.getTransactionId()
+            );
 
-        payment.setAmount(
-                request.getAmount()
-        );
+            payment.setSenderId(
+                    request.getSenderId()
+            );
 
-        payment.setCurrency(
-                request.getCurrency()
-        );
+            payment.setReceiverId(
+                    request.getReceiverId()
+            );
 
-        payment.setStatus(
-                PaymentStatus.PENDING
-        );
+            payment.setAmount(
+                    request.getAmount()
+            );
 
-        paymentRepository.save(payment);
+            payment.setCurrency(
+                    request.getCurrency()
+            );
 
-        // 7. Mark transaction as processed in Redis
-        idempotencyService.save(
-                request.getTransactionId()
-        );
+            payment.setStatus(
+                    PaymentStatus.PENDING
+            );
 
-        // 8. Publish Kafka event
-        PaymentInitiatedEvent event =
-                new PaymentInitiatedEvent(
-                        request.getTransactionId(),
-                        request.getSenderId(),
-                        request.getReceiverId(),
-                        request.getAmount(),
-                        request.getCurrency()
-                );
+            paymentRepository.save(payment);
 
-        eventProducer.publishPaymentInitiated(event);
+            // 7. Publish Kafka event
+            PaymentInitiatedEvent event =
+                    new PaymentInitiatedEvent(
+                            request.getTransactionId(),
+                            request.getSenderId(),
+                            request.getReceiverId(),
+                            request.getAmount(),
+                            request.getCurrency()
+                    );
 
-        // 9. Return response
+            eventProducer.publishPaymentInitiated(event);
+
+        } catch (RuntimeException exception) {
+
+            // Release the idempotency key so the client can safely
+            // retry after a processing failure.
+            idempotencyService.release(
+                    request.getTransactionId()
+            );
+
+            throw exception;
+        }
+
+        // 8. Return response
         return new PaymentResponse(
-                payment.getTransactionId(),
+                request.getTransactionId(),
                 PaymentStatus.PENDING,
                 "Payment initiated successfully"
         );
+    }
+
+    private PaymentResponse duplicateResponse(String transactionId) {
+
+        return paymentRepository
+                .findByTransactionId(transactionId)
+                .map(existing ->
+                        new PaymentResponse(
+                                existing.getTransactionId(),
+                                existing.getStatus(),
+                                "Transaction already processed"
+                        )
+                )
+                .orElseGet(() ->
+                        new PaymentResponse(
+                                transactionId,
+                                PaymentStatus.PENDING,
+                                "Transaction is being processed"
+                        )
+                );
     }
 }
