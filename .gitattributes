@@ -1,0 +1,2 @@
+performance/pcap/*.pcapng filter=lfs diff=lfs merge=lfs -text
+performance/pcap/gateway-parts/*.pcapng filter=lfs diff=lfs merge=lfs -text
